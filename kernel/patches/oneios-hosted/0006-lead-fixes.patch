@@ -1,0 +1,143 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -390,9 +390,17 @@
+ #endif
+ }
+ 
++#if XNU_HOSTED
++extern "C" uint64_t hosted_wall_time(void);
++#endif
++
+ long
+ IOPlatformExpert::getGMTTimeOfDay(void)
+ {
++#if XNU_HOSTED
++	/* OneiOS hosted: the host's clock is the board's real-time clock (the calendar started at 1970 without it). */
++	return (long)hosted_wall_time();
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,8 +77,17 @@
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if XNU_HOSTED
++	/*
++	 * OneiOS hosted: no driver publishes IORTC (the clock is xnuhost's wall_time, read by
++	 * IOPlatformExpert::getGMTTimeOfDay, and is there from the start), so this wait only ever ran out: 30 s of
++	 * every boot with all CPUs idle.
++	 */
++	(void)t;
++#else
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
++#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+diff --git a/osfmk/arm64/hosted/hosted.h b/osfmk/arm64/hosted/hosted.h
+--- a/osfmk/arm64/hosted/hosted.h
++++ b/osfmk/arm64/hosted/hosted.h
+@@ -138,6 +138,7 @@
+ extern void hosted_console_flush(void);
+ extern void hosted_halt(uint32_t reason, uint32_t code) __attribute__((noreturn));
+ extern void hosted_cpu_idle(void);
++extern uint64_t hosted_wall_time(void);
+ extern void hosted_thread_exception_return(void) __attribute__((noreturn));
+ extern uint32_t hosted_text_fixup(void *kva, uint64_t size);
+ 
+diff --git a/osfmk/arm64/hosted/hosted_machine.c b/osfmk/arm64/hosted/hosted_machine.c
+--- a/osfmk/arm64/hosted/hosted_machine.c
++++ b/osfmk/arm64/hosted/hosted_machine.c
+@@ -508,4 +508,17 @@
+ 	hosted_interrupt(state);
+ }
+ 
++/*
++ * The calendar: seconds since 1970 from the host's clock (the wall_time host call). The hosted board has no RTC
++ * device; this is what IOPlatformExpert::getGMTTimeOfDay answers.
++ */
++uint64_t
++hosted_wall_time(void)
++{
++	uint32_t old = hosted_irq_mask();
++	uint64_t seconds = (uint64_t)HC(wall_time);
++	hosted_irq_restore(old);
++	return seconds;
++}
++
+ #endif /* XNU_HOSTED */
+diff --git a/osfmk/arm64/hosted/hosted_user.c b/osfmk/arm64/hosted/hosted_user.c
+--- a/osfmk/arm64/hosted/hosted_user.c
++++ b/osfmk/arm64/hosted/hosted_user.c
+@@ -521,14 +521,14 @@
+ static void
+ hosted_selftest_user(vm_map_t map, uint64_t code, uint64_t data)
+ {
+-	static const uint32_t program[] = {
++	uint32_t program[] = {
+ 		0xd28000e1,     /* mov x1, #7 */
+ 		0xf9000001,     /* str x1, [x0]         a page not touched yet: write fault */
+ 		0xf9400002,     /* ldr x2, [x0] */
+ 		0x91000442,     /* add x2, x2, #1 */
+ 		0x9e670040,     /* fmov d0, x2 */
+ 		0xd4209a40,     /* brk #0x4d2 */
+-		0xd4001001,     /* svc #0x80            trapped where the host has seccomp */
++		0xd4001001,     /* svc #0x80            trapped by seccomp, or marked by text_fixup where there is none */
+ 		0x00000001,     /* udf #1 */
+ 	};
+ 	pmap_t         pmap = map->pmap;
+@@ -537,6 +537,8 @@
+ 	bool           saw_fault = false, saw_brk = false, saw_svc = false, saw_udf = false, x2_ok = false, v0_ok = false;
+ 	int            fills = 0, resolved = 0, interrupts = 0;
+ 
++	/* As cs_text_fixup_page does with a page of signed text before it is mapped. */
++	(void)hosted_text_fixup(program, sizeof(program));
+ 	vm_map_switch_context_t sw = vm_map_switch_to(map);
+ 	int err = copyout(program, code, sizeof(program));
+ 	vm_map_switch_back(sw);
+diff --git a/osfmk/arm64/pcb.c b/osfmk/arm64/pcb.c
+--- a/osfmk/arm64/pcb.c
++++ b/osfmk/arm64/pcb.c
+@@ -1056,7 +1056,8 @@
+ {
+ 	vm_offset_t  stack;
+ 
+-#if __ARM_PAN_AVAILABLE__
++#if __ARM_PAN_AVAILABLE__ && !XNU_HOSTED
++	/* OneiOS hosted: no PSTATE.PAN at EL0, as in machine_switch_context. */
+ 	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
+ 		panic("stack handoff with PAN disabled");
+ 	}
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -416,12 +416,23 @@
+ bool
+ sheng_sigp_recover(cpu_data_t *target_proc)
+ {
++#if XNU_HOSTED
++	/*
++	 * OneiOS hosted: xnuhost never loses an IPI (the line is a level and frame_resume raises it again), so a set
++	 * SIGPdisabled means what it says: the core has not reached processor_cpu_reinit yet. Clearing it from another
++	 * CPU in that window (which is wide when vCPUs are host threads) made the starting core's
++	 * assert_ml_cpu_signal_is_enabled(false) fail. The signal stays pending for it, as in Apple's XNU.
++	 */
++	(void)target_proc;
++	return false;
++#else
+ 	if ((os_atomic_load(&target_proc->cpu_flags, relaxed) & (InitState | StartedState)) != (InitState | StartedState)) {
+ 		return false;
+ 	}
+ 	os_atomic_andnot(&target_proc->cpu_signal, SIGPdisabled, acq_rel);
+ 	os_atomic_inc(&sheng_sigp_recovered, relaxed);
+ 	return true;
++#endif /* XNU_HOSTED */
+ }
+ 
+ static kern_return_t

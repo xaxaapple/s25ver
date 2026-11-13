@@ -1,0 +1,141 @@
+# kernel/: the OneiOS XNU
+
+Owner: release-kernel. The XNU that xnuhost runs: **xnu-12377.121.6, arm64e with PAC, 4 KiB pages, iOS 27.0.1 /
+iPhone18,2 profile**, built from Apple's open source with UniXNU's and Droid-VM's patches.
+
+State (2026-11-10): **it compiles and links on this Linux PC in 91 s (clean, 20 cores), with the board's drivers of `drivers/` inside. It has never run.**
+
+## Build
+
+```sh
+scripts/bg.sh kernel kernel/build-linux.sh       # Linux, no Mac. Or: kernel/build-macos.sh on a Mac
+scripts/bg.sh -s kernel                          # state; log in logs/kernel.log
+```
+
+| Output | What |
+|---|---|
+| `out/kernel/builds/<build id>/xnu.macho` | the native kernel: arm64e `MH_EXECUTE`, PIE, chained fixups, no Apple kext |
+| `.../xnu.macho.build.json` | the build record: sources, every patch with its SHA-256, configuration, host, whether it may be released |
+| `.../series.txt` | the 94 patches in order |
+| `out/kernel/current` | link to the last build |
+
+Last build: `xnu-12377.121.6-ios-27.0.1-24A446-62c8ff7800cd`, 23,735,992 bytes, clang 23.1.4 + ld64-956.6.
+The build id is a hash of the inputs (XNU commit, patches, configuration, UniXNU commit, the board archives'
+sources), not of the machine. The kernel's bytes are not reproducible: two builds of the same id differ.
+
+Other entry points: `kernel/fetch.sh` (sources at the pins of `pins.sh`, 40 MB), `kernel/series-tree.sh` (the
+patched tree with one commit per patch, for writing patches), `kernel/tests/host.sh` (CI), `kernel/publish.sh`.
+
+### What is built from what
+
+1. `external/Droid-VM-UniXNU` (`62d0b11`): UniXNU's build driver, its arm64e series (68 patches) and the Darwin 26
+   patches (4). Why this fork and not upstream: `profiles/iphone18-2-ios27.md` section 1.
+2. `kernel/unixnu/profiles/os/ios-27.0.1-24A446/`: the OS profile, copied into that checkout at each build.
+3. `kernel/device/`: OneiOS as a UniXNU device repository: `board.toml`, `configs/oneios_defconfig`,
+   `socs/linuxhost`, and the board series `patches/xnu-12377/series`: 18 of Droid-VM's iPadOS 27 patches, one of
+   xnu-linux-toolchain, three of ours.
+4. `kernel/patches/unixnu/`: our changes to the driver itself (one: keep the submodules we checked out).
+5. Driver archives linked in: ArmDTPlatform, ArmCpu, libpthread's kernel part, libfirehose, and UniXNU's source
+   corecrypto (see "Releases").
+6. The board's own archives, built between the two kernel passes by `device/scripts/build-oneios-board.py` and
+   force-loaded through `CONFIG_XNU_EXTRA_LD_ARCHIVES`: `liboneiosdrivers.a` (`drivers/build.py`: the bridge
+   transport, haptics, Bluetooth; 9 sources) and `liboneiosboard.a` (Droid-VM's `DroidVMCpufreq.c`, unchanged).
+   `oneios_board_late_start()` (`oneios-board-start.patch`), called from `bsd_init` after the storage hook, runs
+   `droidvm_cpufreq_attach()` and `oneios_drivers_start()`. The build record lists the ten sources.
+
+The driver stops before the prelink (`--skip-prelink`): no kernelcache is read.
+
+### Linux (`build-linux.sh`)
+
+Host packages: `clang lld llvm git make cmake ninja python3 flex bison m4 autoconf automake pkg-config bubblewrap`,
+libdispatch with BlocksRuntime (Arch: `swift` or `libdispatch`; Debian: `libdispatch-dev libblocksruntime-dev`),
+`libbsd`, `libuuid`. No root, no SDK, no KDK.
+
+- `linux/setup-toolchain.sh` builds [xnu-linux-toolchain](https://github.com/Allenwdk/xnu-linux-toolchain) (pin
+  `909990e`) into `out/toolchain`: cctools-port ld64-956.6, mig, lzfse, unifdef, tcsh and the Python `iig`, all at
+  pinned commits (its own bootstrap clones branch heads). A few minutes, once.
+- `linux/unixnu-layout.sh` arranges those tools the way UniXNU's Linux kernel step expects its own toolchain
+  (`out/toolchain/unixnu`), with the host's clang in place of the clang UniXNU builds from LLVM.
+- `linux/clang-wrapper` is the compiler xnu's makefiles get: the arm64e triple, the ptrauth and destructor flags
+  Apple's clang has by default, ARMv8.5 for the assembler, ld64 for links, warnings off.
+- xnu's makefiles call `/usr/bin/xcrun`, `/usr/bin/plutil`, `/usr/bin/codesign` and `/bin/csh`. The build runs inside
+  bubblewrap with a temporary overlay on `/usr/bin` that has them; nothing on disk changes.
+
+What differs from a build with Apple's clang (recorded in the build record's `host`):
+
+| Difference | Effect |
+|---|---|
+| no `__builtin_xnu_type_*` (`portable-kalloc-type-builtins.patch`) | every kalloc type goes to the data heap: weaker isolation, same function |
+| `__ptrauth(..., "authenticates-null-values")` is not available (`oneios-stock-clang-ptrauth.patch`) | a null `ucred.cr_label` or IOCircularDataQueue pointer is stored as 0, where Apple's clang stores it signed. A kext built with Apple's clang that loads such a null field fails its authentication. [U] whether the original sandbox or AMFI kext ever sees a null `cr_label` |
+| the Python `iig` (`oneios-no-apple-iig.patch`) | no DriverKit RPC: `*_Invoke` answer unsupported, no dext runs |
+| warnings off for the kernel's sources | a wrong pointer type in old code stays quiet; errors still stop the build |
+| stock clang 23 code generation | the same instruction set (ARMv8.3 + PAC by default); not compared against an Xcode build |
+
+The Mac build is the reference for all five. Nobody has compared the two kernels yet.
+
+### macOS (`build-macos.sh`), the fallback
+
+Needs macOS 27 with **Xcode 27.1** at `/Applications/Xcode.app` (`XCODE_APP=`; another version only with
+`ALLOW_XCODE=1`), its iphoneos SDK, and Homebrew's `cmake ninja unifdef llvm lld` (installed when missing). It exports
+`MACOS_VERSION=26.5` (the macOS release of xnu-12377.121.6) and checks it against the OS profile. `KDK_HEADERS=1`
+adds a headers-only `KDKROOT` (`kdk-headers.py`: about 200 headers of KDK 26.5.2 25F84 read over HTTP, no 1.2 GB
+download), as iOSPlus10's `scripts/ios26/build-kernel.sh` does; off by default because UniXNU's series replaces
+those headers with public ones. Same series, configuration, record and output place as Linux.
+**Written and syntax-checked only (`bash -n`); it has not run: there is no Mac here.**
+
+## What the booter gets (kernel -> booter)
+
+| | |
+|---|---|
+| File | `out/kernel/current/xnu.macho` (native), later `kernel.kc` in the image set (the same kernel prelinked with the original kexts) |
+| Format | Mach-O 64, `CPU_TYPE_ARM64` / `CPU_SUBTYPE_ARM64E` (caps PAC00), `MH_EXECUTE`, `MH_PIE`, `LC_DYLD_CHAINED_FIXUPS` |
+| Link addresses | `__TEXT` `0xfffffff007004000`, `__PRELINK_TEXT` `0xfffffff004004000`; segments 16 KiB aligned; last address `0xfffffff0087c4000` in the last build |
+| Entry | `LC_UNIXTHREAD` pc `0xfffffff007545488` in the last build (`_start`, `osfmk/arm64/start.s`); it moves with every change, read it from the file or the record |
+| Entry state the kernel expects **today** | as DarwinBoot gives it: EL1, MMU and caches off, at the **physical** address of `_start`, `x0` = physical address of `boot_args`, interrupts masked |
+| `boot_args` | revision 2, version 2: `virtBase`, `physBase`, `memSize`, `topOfKernelData`, `Video` (six 64-bit values), `machineType`, `deviceTreeP`, `deviceTreeLength`, `CommandLine[1024]`, `bootFlags`, `memSizeActual` (UniXNU boot chain, "DarwinBoot to XNU": offsets 0x00 to 0x478) |
+| Self-relocation | built with chained fixups (`CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y`): the kernel rebases itself for the slide it is loaded at |
+| Page size | 4 KiB kernel (`BCM2837` config, `__ARM64_PMAP_SUBPAGE_L1__`), 16 KiB user ABI |
+| Device tree | Apple format. ArmDTPlatform needs `/cpus`, `/arm-io`, `/defaults`, `/options` and a CHRP NVRAM proxy in `/chosen`; ArmCpu the GICv3 windows, the timer and `/psci` (`runtime/loader` already builds these from Droid-VM's `make-droidvm-adt.py`). Identity: `kernel/profiles/iphone18-2-ios27.md` section 2 |
+| Interrupts, timer, CPUs | ArmCpu: GICv3 (distributor, redistributors), IPIs as SGIs or SPIs (`armcpu-self-ipi=1`, `armcpu-spi-ipi=1`), the virtual timer PPI 27, secondary cores by PSCI `CPU_ON` (`hvc`/`smc`) |
+| PAC | `HAS_NATIVE_PAC`: at each CPU's start the kernel writes ten key registers (`AP{IA,IB,DA,DB,GA}Key{Lo,Hi}_EL1`) from one stored key set. A host must ignore these writes and let the kernel and every task use the process's own keys |
+| Timebase | `droidvm-timebase-24mhz`: userland sees 24 MHz; the boot argument `droidvm-timebase-hz` gives the target |
+| Boot arguments to start from | Droid-VM's `ipados27/board.toml` `kernel_args`, with its `sheng-`/`droidvm-` display values replaced as in `kernel/profiles/iphone18-2-ios27.md` section 4. For the GPU: `vgpu-3d=1 droidvm-gpu-metal=1` |
+| CPU topology | `__ARM_AMP__` (`droidvm-amp.patch`): **every `/cpus` node must carry `cluster-type`** (`"E"` or `"P"`), or the kernel panics in `cluster_type_to_pset_type()`. `/arm-io/cpufreq` is DroidVMCpufreq's window (`drivers/cpu/README.md`) |
+| Board drivers | ArmDTPlatform, ArmCpu, the bridge transport, haptics, Bluetooth and cpufreq. **No storage, display, input or GPU driver yet.** See "Not done" |
+| Linking a board archive | build it in `device/scripts/build-oneios-board.py` into `{tree}/build/oneios-NAME/` with an `objects.json` (path and SHA-256 of each source), add it to `CONFIG_XNU_EXTRA_LD_ARCHIVES` in the defconfig, and start it from `oneios_board_late_start()`; storage starts from `native_source_storage_start()` (weak), just before |
+
+Privileged instructions, for the trap layer (`llvm-objdump -d` of the first build, `b41b5b1d4a8e`, before the board
+archives and AMP): 875 `mrs`/`msr`
+of 85 distinct registers, 127 `wfe`, 101 `tlbi`, 85 `dc`, 4 `ic`, 4 `at`, 4 `wfi`, 6 `smc`, 1 `hvc`.
+
+## Not done
+
+1. **The hosted machine layer.** `runtime/xnuhost/include/xnuhost/hostcall.h` describes a kernel entered with
+   `x0` = virtual `boot_args`, `x1` = the host vector, `x2` = the vCPU block, no MMU, interrupts as a software flag
+   and tasks through `task_map`/`thread_run`. This kernel has none of that: its `start.s`, `locore.s`, pmap,
+   `cpu.c`, context switch and copyio are the EL1 ones. It can only run where EL1 is emulated or trapped
+   (the plan's M2: a `LINUXHOST` machine configuration beside `BCM2837`, new pmap, kernel linked low).
+   The kernel is also linked in the high half (`0xfffffff0...`), which a Linux process cannot map.
+2. **The board's drivers.** Droid-VM's source storage (NativeVirtioBlock, RamBlock, the Data store, verified root),
+   legacy display, HID input, virtio-gpu and devices archives are not in `board.toml`. They are the ones xnuhost's
+   virtio models need (references agent, `docs/agents.md`). Two of their reviewed inputs
+   (`legacy-display-24A446.json`, `hid-device-24A446.json`) are for the iPad kernelcache and must be redone for
+   `kernelcache.release.v54`; the storage archive needs the owner keys. For the hosted kernel the storage, GPU and
+   display archives exist (`patches/oneios-hosted/storage`, `gpu`, `display`; the display's input is redone there,
+   `display/legacy-display-24A446-v54.json`); the VM kernel still has none of them.
+3. **The prelink** (`kernel.kc`): needs the AMFI address, the class list and the reviewed fileset of the iPhone
+   kernelcache (`profiles/iphone18-2-ios27.md` section 3). `kernelcache_sha256` is pinned.
+4. A Mac build, and a comparison of it with the Linux build.
+5. Any boot.
+
+## Releases and licences
+
+- XNU is under the Apple Public Source License 2.0; a kernel in a release carries `kernel/NOTICE.kernel` and its
+  build record names every modification (APSL 2.2).
+- **The kernel built today may not be released**, and `runtime/package.sh` leaves it out: UniXNU's kernel recipe
+  links its source corecrypto (`corecrypto-2023`, Apple's Internal Use License, no redistribution), and the ArmCpu
+  and pthread recipes require it. The record says `"releasable": false`. Owners build the kernel themselves
+  (91 s on Linux); a release is runtime-only until a configuration without that source links and boots.
+- Never in git or a release: the kernelcache, a prelinked `kernel.kc`, KDK headers (`out/`).
+- UniXNU, UniXNU-droidvm: BSD-2-Clause-Patent. xnu-linux-toolchain: see its repository. libdispatch (firehose):
+  Apache 2.0. libpthread, libplatform: APSL 2.0.

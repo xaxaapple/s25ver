@@ -1,0 +1,100 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 3907c55..3e67fed 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -791,6 +791,9 @@ bsd_init(void)
+ 	extern void native_source_storage_start(void) __attribute__((weak_import));
+ 	if (&native_source_storage_start)
+ 		native_source_storage_start();
++	/* OneiOS: the board's drivers that are not storage (osfmk/arm64/oneios_host.c). */
++	extern void oneios_board_late_start(void);
++	oneios_board_late_start();
+ #if DEVELOPMENT || DEBUG
+ 	native_apfs_load_probe();
+ 	native_mobile_graphics_load_probe();
+diff --git a/osfmk/arm64/oneios_host.c b/osfmk/arm64/oneios_host.c
+new file mode 100644
+index 0000000..9823554
+--- /dev/null
++++ b/osfmk/arm64/oneios_host.c
+@@ -0,0 +1,69 @@
++/*
++ * OneiOS (https://github.com/akshaynexus/OneiOS, kernel/): the board's late start, and defaults for symbols that
++ * a board archive or a toolchain supplies, so the kernel links without them. Every default is weak: the real
++ * definition wins when it is linked.
++ */
++#include <stdint.h>
++#include <sys/cdefs.h>
++
++/*
++ * Droid-VM's source-storage-start.patch calls this after the IOKit bootstrap when a board's source-built
++ * storage is linked (XNU_EXTRA_LD_ARCHIVES). Without one there is nothing to start.
++ */
++__attribute__((weak)) void
++native_source_storage_start(void)
++{
++}
++
++/*
++ * The board's late start, called from bsd_init after the IOKit bootstrap and the storage hook. Each part is in
++ * an archive linked with CONFIG_XNU_EXTRA_LD_ARCHIVES (kernel/device/scripts/build-oneios-board.py); the weak
++ * defaults below stand in for a part that is not linked.
++ *   oneios_drivers_start     drivers/ of the OneiOS repository: the bridge transport, haptics, Bluetooth
++ *   droidvm_cpufreq_attach   UniXNU-droidvm package/DroidVMCpufreq.c: preferred clusters, frequency requests
++ */
++__attribute__((weak)) void
++oneios_drivers_start(void)
++{
++}
++
++__attribute__((weak)) void
++droidvm_cpufreq_attach(void)
++{
++}
++
++void oneios_board_late_start(void);
++
++void
++oneios_board_late_start(void)
++{
++	droidvm_cpufreq_attach();
++	oneios_drivers_start();
++}
++
++/*
++ * OSKext's PGO export calls these two in compiler-rt's profile runtime (libcc_kext.a of an Apple toolchain).
++ * The kernel is not built with profile instrumentation: no data, and a write reports failure.
++ */
++__attribute__((weak)) uint64_t
++__llvm_profile_get_size_for_buffer_internal(
++	const char *data_begin __unused, const char *data_end __unused,
++	const char *counters_begin __unused, const char *counters_end __unused,
++	const char *bitmap_begin __unused, const char *bitmap_end __unused,
++	const char *names_begin __unused, const char *names_end __unused,
++	const char *vtable_begin __unused, const char *vtable_end __unused,
++	const char *vnames_begin __unused, const char *vnames_end __unused)
++{
++	return 0;
++}
++
++__attribute__((weak)) int
++__llvm_profile_write_buffer_internal(
++	char *buffer __unused,
++	const char *data_begin __unused, const char *data_end __unused,
++	const char *counters_begin __unused, const char *counters_end __unused,
++	const char *bitmap_begin __unused, const char *bitmap_end __unused,
++	const char *names_begin __unused, const char *names_end __unused)
++{
++	return -1;
++}
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 0db4600..ae0880e 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -129,3 +129,6 @@ osfmk/kern/ecc_init.c		standard
+ osfmk/kern/ecc_logging.c	optional config_ecc_logging
+ 
+ osfmk/kern/memory_error_logging.c	standard
++
++# OneiOS: weak defaults for board and toolchain symbols
++osfmk/arm64/oneios_host.c	standard

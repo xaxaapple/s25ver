@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: MIT
+// The OneiOS bridge channel: one virtio-mmio device ("oneios,bridge" in /arm-io) that carries small
+// messages between the guest drivers in drivers/ and the host bridges in runtime/bridges/.
+// Freestanding C, included unchanged by the kernel side and by xnuhost.
+//
+// Queue 0 (guest to host): one readable buffer per message. Queue 1 (host to guest): the guest posts
+// writable buffers of OB_MAX_MESSAGE bytes; the host fills one per message. A message is this header
+// and `length` payload bytes. All values little-endian.
+#ifndef ONEIOS_BRIDGE_PROTO_H
+#define ONEIOS_BRIDGE_PROTO_H
+
+#include <stdint.h>
+
+#define OB_VIRTIO_DEVICE_ID 0x4f42u      // not a registered VirtIO id; the guest matches the node, not the id
+#define OB_PROTO_VERSION    1u
+#define OB_MAX_MESSAGE      4096u
+#define OB_MAX_PAYLOAD      (OB_MAX_MESSAGE - 8u)
+#define OB_QUEUE_TX         0u           // guest to host
+#define OB_QUEUE_RX         1u           // host to guest
+
+struct ob_header {
+  uint16_t channel;                      // OB_CH_*
+  uint16_t type;                         // per channel
+  uint32_t length;                       // payload bytes after the header
+};
+
+enum { OB_CH_CONTROL = 0, OB_CH_HAPTIC = 1, OB_CH_HCI = 2, OB_CH_CAMERA = 3, OB_CH_BRIGHTNESS = 4, OB_CH_BATTERY = 5, OB_CH_COUNT = 6 };
+
+// ---- control ----------------------------------------------------------------------------------
+// guest -> host OB_CTL_HELLO { u32 version }; host -> guest OB_CTL_HELLO { u32 version, u32 channels }
+// where bit n of channels says the host serves channel n.
+enum { OB_CTL_HELLO = 1 };
+struct ob_ctl_hello { uint32_t version, channels; };
+
+// ---- haptics (guest -> host only) -------------------------------------------------------------
+enum {
+  OB_HAPTIC_VIB = 1,                     // struct ob_haptic_vib: vibrate from now; on_ms 0 stops
+  OB_HAPTIC_STOP = 2,                    // no payload
+};
+struct ob_haptic_vib {
+  uint32_t on_ms;                        // 0 = stop
+  uint16_t intensity;                    // 0..1000 (iOS's 0.0..1.0)
+  uint16_t frequency_hz;                 // 0 = the actuator's own (resonance)
+};
+
+// ---- Bluetooth HCI ----------------------------------------------------------------------------
+// Types 1..5 are the H4 packet indicators and carry one whole HCI packet (without the indicator).
+enum {
+  OB_HCI_COMMAND = 1, OB_HCI_ACL = 2, OB_HCI_SCO = 3, OB_HCI_EVENT = 4, OB_HCI_ISO = 5,
+  OB_HCI_OPEN = 16,                      // guest -> host: power the controller, no payload
+  OB_HCI_CLOSE = 17,                     // guest -> host: release it
+  OB_HCI_STATE = 18,                     // host -> guest: struct ob_hci_state
+};
+enum { OB_HCI_STATE_OFF = 0, OB_HCI_STATE_READY = 1, OB_HCI_STATE_FAILED = 2 };
+struct ob_hci_state { uint32_t state; uint8_t bd_addr[6]; uint8_t reserved[2]; };
+
+// ---- brightness (drivers/brightness, runtime/bridges/brightness) ------------------------------
+enum {
+  OB_BRIGHT_SET = 1,                     // guest -> host: struct ob_bright_set
+  OB_BRIGHT_QUERY = 2,                   // guest -> host: no payload; the host answers OB_BRIGHT_STATE
+  OB_BRIGHT_STATE = 3,                   // host -> guest: struct ob_bright_state
+  OB_BRIGHT_ALS = 4,                     // host -> guest: struct ob_bright_als, when the light changes and every 2 s
+};
+enum { OB_BRIGHT_LINEAR = 1u };          // ob_bright_set.flags: the level is a fraction of the light, not of the slider
+enum { OB_BRIGHT_HAS_PANEL = 1u, OB_BRIGHT_HAS_ALS = 2u };      // ob_bright_state.flags
+struct ob_bright_set {
+  uint32_t level;                        // 0..65535 of the panel's range for iOS; 0 is the lowest level, not off
+  uint32_t fade_ms;                      // the host walks to the level in this time; 0 = at once
+  uint32_t flags;                        // OB_BRIGHT_LINEAR
+};
+struct ob_bright_state {
+  uint32_t flags;                        // OB_BRIGHT_HAS_*
+  uint32_t max_nits;                     // the light at level 65535
+  uint32_t min_millinits;                // the light at level 0
+  uint32_t level;                        // where the panel is now on the slider's scale, 0..65535
+};
+struct ob_bright_als {
+  uint32_t millilux;
+  uint32_t clear, ir, uv;                // the sensor's channel counts
+};
+
+// ---- battery (drivers/battery, runtime/bridges/battery) ---------------------------------------
+enum {
+  OB_BATTERY_QUERY = 1,                  // guest -> host: no payload; the host answers OB_BATTERY_STATE, then reports changes
+  OB_BATTERY_STATE = 2,                  // host -> guest: struct ob_battery_state
+};
+enum { OB_BATTERY_PRESENT = 1u, OB_BATTERY_PLUGGED = 2u, OB_BATTERY_CHARGING = 4u, OB_BATTERY_FULL = 8u };   // ob_battery_state.flags
+#define OB_BATTERY_UNKNOWN INT32_MIN     // temp_deci_c, current_ma
+struct ob_battery_state {
+  uint32_t flags;                        // OB_BATTERY_*
+  uint32_t percent;                      // 0..100
+  int32_t  temp_deci_c;                  // tenths of a degree Celsius, or OB_BATTERY_UNKNOWN
+  uint32_t voltage_mv;                   // 0 = unknown
+  int32_t  current_ma;                   // into the battery > 0, out of it < 0, or OB_BATTERY_UNKNOWN
+  uint32_t full_mah, design_mah;         // never 0
+  uint32_t cycles;                       // 0 = unknown
+  int32_t  minutes;                      // to empty, or to full while charging; -1 = unknown
+};
+
+#endif
