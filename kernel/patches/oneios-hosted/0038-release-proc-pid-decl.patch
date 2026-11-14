@@ -1,0 +1,12 @@
+diff --git a/osfmk/arm64/hosted/hosted_machine.c b/osfmk/arm64/hosted/hosted_machine.c
+--- a/osfmk/arm64/hosted/hosted_machine.c
++++ b/osfmk/arm64/hosted/hosted_machine.c
+@@ -33,6 +33,8 @@
+ #include <string.h>
+ 
+ extern int vsnprintf(char *, size_t, const char *, va_list) __printflike(3, 0);
++struct proc;
++extern int proc_pid(struct proc *); /* a RELEASE build gets no declaration from the headers above */
+ 
+ #if XNU_HOSTED
+ 
