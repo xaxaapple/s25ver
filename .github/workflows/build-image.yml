@@ -1,0 +1,161 @@
+# Build the OneiOS image set (iOS 27.0.1 24A446, iPhone18,2) on a GitHub runner and hand it over in parts.
+#
+# The image is made from Apple's IPSW, fetched here from Apple's CDN with scripts/fetch/fetch.sh, exactly as on your
+# own PC (docs/building.md sections 1 to 3). It is Apple's software: it is never committed and never put in a
+# release. Delivery is a private hand-over to you: the .tar.zst is cut into parts (default 1900 MB) that go to
+#   - gofile.io (an unlisted link; the page and the parts' links are printed in the run's summary), and/or
+#   - the run's artifacts (parts, 3 days; the account's artifact storage must have room for ~11 GB).
+# Anyone who has a gofile link can download it: do not post the link.
+#
+# Put the parts together on the phone or PC:  cat OneiOS_*.tar.zst.part-* > OneiOS_iOS27.0.1_24A446_iPhone18-2.tar.zst
+# and check it:  sha256sum -c OneiOS_iOS27.0.1_24A446_iPhone18-2.tar.zst.sha256
+# Disk: about 60 GB at the peak (IPSW 11 + sources and kernel build + image 11 + its tar 11); the runner has ~93 GB free
+# once the preinstalled toolchains are removed (first step).
+name: build-image
+on:
+  workflow_dispatch:
+    inputs:
+      delivery:
+        description: "Where the parts go: gofile, artifact or both"
+        default: gofile
+        type: choice
+        options: [gofile, artifact, both]
+      part_mb:
+        description: "Part size in MB"
+        default: "1900"
+      no_hook:
+        description: "Build the image without the userland hook (the seed is the OS volume's own /private/var)"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      P: profiles/ios-27.0.1-iPhone18,2.toml
+      NAME: OneiOS_iOS27.0.1_24A446_iPhone18-2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore executable bits (an upload drops them)
+        run: git ls-files -z | xargs -0 grep -lZI '^#!' 2>/dev/null | xargs -0 -r chmod +x
+      - name: Free disk (preinstalled toolchains this job does not use)
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo apt-get clean || true
+          df -h /
+      - name: Tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd clang lld llvm python3 python3-pip python3-yaml git curl patch xz-utils bzip2 \
+            cmake g++ make pkg-config fuse3 libfuse3-dev libicu-dev libbz2-dev zlib1g-dev libattr1-dev qemu-user jq \
+            ninja-build flex bison m4 autoconf automake libtool bubblewrap libblocksruntime-dev libbsd-dev uuid-dev
+          # Ubuntu 24.04 runners block unprivileged user namespaces (bubblewrap, used by the kernel build)
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          # libdispatch: Ubuntu 24.04 has no libdispatch-dev package (the old one was dropped), so take the distro's if it
+          # exists and otherwise build swift-corelibs-libdispatch into /usr/local (kernel/linux/setup-toolchain.sh needs it)
+          if ! sudo apt-get install -y libdispatch-dev; then
+            git clone --depth 1 --branch swift-6.0-RELEASE https://github.com/swiftlang/swift-corelibs-libdispatch.git /tmp/libdispatch
+            cmake -S /tmp/libdispatch -B /tmp/libdispatch/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DENABLE_SWIFT=OFF -DBUILD_TESTING=OFF \
+              -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            cmake --build /tmp/libdispatch/build -j"$(nproc)"
+            sudo cmake --install /tmp/libdispatch/build
+            echo /usr/local/lib | sudo tee /etc/ld.so.conf.d/local-dispatch.conf
+          fi
+          sudo ldconfig
+          ldconfig -p | grep -E 'libdispatch|libBlocksRuntime'
+          ls /usr/include/dispatch/dispatch.h /usr/local/include/dispatch/dispatch.h 2>/dev/null
+          # apfs-fuse: reads the OS volume read-only, without root (docs/building.md section 0)
+          git clone --depth 1 --recurse-submodules https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/apfs-fuse/build -j"$(nproc)"
+          sudo install /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
+          # lzfse: kernel-inputs.sh decompresses the kernelcache with the lzfse CLI
+          git clone --depth 1 https://github.com/lzfse/lzfse.git /tmp/lzfse
+          cmake -S /tmp/lzfse -B /tmp/lzfse/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/lzfse/build -j"$(nproc)"
+          sudo install /tmp/lzfse/build/lzfse /usr/local/bin/lzfse
+          command -v lzfse apfs-fuse zstd python3
+          sudo sh -c 'echo user_allow_other >> /etc/fuse.conf' || true
+      - name: Sources of the kernel and of the references
+        run: |
+          set -euxo pipefail
+          scripts/setup/get-references.sh
+          kernel/fetch.sh
+      - name: Apple's IPSW members (about 10.6 GiB, from Apple's CDN)
+        run: |
+          set -euxo pipefail
+          scripts/fetch/get-ipsw-cli.sh
+          scripts/fetch/fetch.sh "$P"
+          scripts/image/kernel-inputs.sh "$P"
+          df -h /
+      - name: Hosted kernel
+        run: |
+          set -euxo pipefail
+          env HOSTED_OUT=ci kernel/build-hosted.sh
+      - name: Kernel collection (kernel.kc)
+        run: |
+          set -euxo pipefail
+          env KERNEL=out/kernel/current-hosted-ci/xnu.macho kernel/prelink/build.sh
+          ls -l out/kernel/24A446/kernel.kc
+      - name: Image set
+        run: |
+          set -euxo pipefail
+          hook=""
+          [ "${{ inputs.no_hook }}" = true ] && hook="--no-hook"
+          scripts/image/build.sh "$P" --kernel out/kernel/24A446/kernel.kc $hook
+          scripts/image/verify.sh "out/image/$NAME.tar.zst"
+          # Not needed any more: free the room for the parts.
+          rm -rf inputs out/kernel out/kernel-inputs "out/image/24A446" external
+          df -h /
+      - name: Parts
+        run: |
+          set -euxo pipefail
+          mkdir -p parts
+          mv "out/image/$NAME.tar.zst" "out/image/$NAME.tar.zst.sha256" parts/
+          cd parts
+          split -b "${{ inputs.part_mb }}M" -d -a 3 "$NAME.tar.zst" "$NAME.tar.zst.part-"
+          rm "$NAME.tar.zst"
+          sha256sum "$NAME".tar.zst.part-* > "$NAME.parts.sha256"
+          ls -l
+      - name: gofile
+        if: inputs.delivery != 'artifact'
+        run: |
+          set -euo pipefail
+          cd parts
+          # A guest upload makes a folder; the later parts go into it with the guest token (api.gofile.io, as documented).
+          up() { # FILE [folderId token]
+            for try in 1 2 3 4 5; do
+              if [ -n "${2:-}" ]; then
+                r=$(curl -fsS --retry 3 -H "Authorization: Bearer $3" -F "folderId=$2" -F "file=@$1" https://upload.gofile.io/uploadfile) && break
+              else
+                r=$(curl -fsS --retry 3 -F "file=@$1" https://upload.gofile.io/uploadfile) && break
+              fi
+              echo "upload of $1 failed (try $try)"; sleep 20; r=""
+            done
+            [ -n "$r" ] || { echo "gofile: $1 not uploaded" >&2; return 1; }
+            echo "$r"
+          }
+          first=1; folder=""; token=""; page=""
+          for f in "$NAME".tar.zst.sha256 "$NAME.parts.sha256" "$NAME".tar.zst.part-*; do
+            if [ $first = 1 ]; then
+              r=$(up "$f"); folder=$(echo "$r" | jq -r '.data.parentFolder'); token=$(echo "$r" | jq -r '.data.guestToken'); page=$(echo "$r" | jq -r '.data.downloadPage'); first=0
+            else
+              up "$f" "$folder" "$token" >/dev/null
+            fi
+            echo "uploaded $f"
+          done
+          echo "gofile: $page"
+          { echo "### gofile"; echo; echo "$page"; echo; echo "Parts: \`cat $NAME.tar.zst.part-* > $NAME.tar.zst\`, then \`sha256sum -c $NAME.tar.zst.sha256\`."; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.delivery != 'gofile'
+        with:
+          name: oneios-image-parts
+          path: parts/
+          retention-days: 3
+          compression-level: 0
