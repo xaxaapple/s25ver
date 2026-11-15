@@ -1,0 +1,59 @@
+# The Galaxy S25 kit: the runtime package (built with the pinned NDK) and the phone probe in one artifact, for a
+# manual run. Download the artifact, push the probe with adb, run it as root, and send its .tar.gz back
+# (docs/s25.md, "What the probe answers"). Nothing of Apple's is downloaded or packed here.
+name: s25-phone-kit
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Runtime version label (letters, digits, . _ -)"
+        default: "0.0.0-s25"
+permissions:
+  contents: read
+jobs:
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Script syntax
+        run: |
+          set -euo pipefail
+          bash -n tools/probe/s25-probe.sh
+          git ls-files -z '*.sh' | xargs -0 -n1 bash -n
+      - name: Restore executable bits (an upload drops them)
+        run: git ls-files -z | xargs -0 grep -lZI '^#!' 2>/dev/null | xargs -0 -r chmod +x
+      - name: NDK 28.2.13676358 and the Rust target
+        run: .github/scripts/setup-build.sh
+      - name: Sources the runtime links (Droid-VM's virglrenderer for drm2kgsl, the 3D GPU)
+        # Without this checkout xnuhost builds 2D-only: the guest then offers no 3D (the S25 boot said "the host offers no 3D").
+        run: |
+          set -euo pipefail
+          scripts/setup/get-references.sh virglrenderer
+          test -f external/virglrenderer/src/drm/drm2kgsl/drm2kgsl_renderer.c || { echo "virglrenderer checkout has no drm2kgsl"; exit 1; }
+      - name: Bridge tests (CPU plan for the S25's Oryon cores, display defaults)
+        run: |
+          set -euo pipefail
+          make -C runtime/bridges test
+          make -C runtime/xnuhost build/host/test_xnuhost build/host/test_display_mode build/host/test_imageset
+          # LeakSanitizer is off: the tests keep their devices until exit, on purpose.
+          for t in test_xnuhost test_display_mode test_imageset; do ASAN_OPTIONS=detect_leaks=0 runtime/xnuhost/build/host/$t; done
+      - name: Runtime package
+        run: runtime/package.sh "${{ inputs.version }}"
+      - name: Kit
+        run: |
+          set -euo pipefail
+          mkdir -p kit
+          cp tools/probe/s25-probe.sh kit/
+          cp out/release/*.tar.zst out/release/*.sha256 kit/
+          cat > kit/README.txt <<'TXT'
+          1. adb push s25-probe.sh /data/local/tmp/
+          2. adb shell su -c 'sh /data/local/tmp/s25-probe.sh'
+          3. adb pull /data/local/tmp/oneios-s25-probe-*.tar.gz   (or take it from Download on the phone)
+          Send the .tar.gz. The probe is read-only and takes no serial number, IMEI or account.
+          TXT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oneios-s25-kit
+          path: kit/
+          retention-days: 14
